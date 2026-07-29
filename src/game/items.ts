@@ -1,5 +1,7 @@
 import type { Slot } from '../lib/types'
+import { FURNITURE, IGLOO_STYLES } from './furniture'
 import { PENGUIN_COLORS, shade, withAlpha } from './palette'
+import { PUFFLE_COLORS, pufflePreviewSwatch } from './puffles'
 
 /**
  * Penguin geometry, in "penguin local space": feet sit on y = 0, up is negative,
@@ -34,7 +36,7 @@ export interface DrawCtx {
 export interface Item {
   id: string
   name: string
-  slot: Slot | 'color'
+  slot: Slot | 'color' | 'furniture' | 'igloo'
   cost: number
   /** Drawn behind the penguin (capes). */
   drawBack?: (ctx: CanvasRenderingContext2D, d: DrawCtx) => void
@@ -509,6 +511,24 @@ export const ITEMS: Item[] = [
 
   { id: 'feet_boots', name: 'Snow Boots', slot: 'feet', cost: 130, draw: boots },
   { id: 'feet_skis', name: 'Tiny Skis', slot: 'feet', cost: 280, draw: skis },
+
+  // Puffles are drawn beside the penguin rather than on it, so they carry no
+  // draw function here — see puffles.ts.
+  { id: 'puffle_blue', name: 'Blue Puffle', slot: 'puffle', cost: 200 },
+  { id: 'puffle_pink', name: 'Pink Puffle', slot: 'puffle', cost: 200 },
+  { id: 'puffle_green', name: 'Green Puffle', slot: 'puffle', cost: 250 },
+  { id: 'puffle_purple', name: 'Purple Puffle', slot: 'puffle', cost: 300 },
+  { id: 'puffle_red', name: 'Red Puffle', slot: 'puffle', cost: 350 },
+  { id: 'puffle_yellow', name: 'Yellow Puffle', slot: 'puffle', cost: 400 },
+  { id: 'puffle_orange', name: 'Orange Puffle', slot: 'puffle', cost: 450 },
+  { id: 'puffle_white', name: 'White Puffle', slot: 'puffle', cost: 600 },
+  { id: 'puffle_black', name: 'Black Puffle', slot: 'puffle', cost: 750 },
+  { id: 'puffle_rainbow', name: 'Rainbow Puffle', slot: 'puffle', cost: 1200 },
+
+  // Furniture and igloo styles keep their costs in furniture.ts; mirroring them
+  // into the catalogue means buy_item() and the inventory work unchanged.
+  ...FURNITURE.map((f): Item => ({ id: f.id, name: f.name, slot: 'furniture', cost: f.cost })),
+  ...IGLOO_STYLES.map((s): Item => ({ id: s.id, name: s.name, slot: 'igloo', cost: s.cost })),
 ]
 
 export const ITEMS_BY_ID: Record<string, Item> = Object.fromEntries(ITEMS.map((i) => [i.id, i]))
@@ -520,9 +540,13 @@ export const SLOT_LABELS: Record<string, string> = {
   neck: 'Neck',
   hand: 'Hand',
   feet: 'Feet',
+  puffle: 'Puffles',
+  furniture: 'Furniture',
+  igloo: 'Igloos',
 }
 
-/** Swatch colour used for colour items in the shop grid. */
+/** Swatch colour used for colour and puffle items in the shop grid. */
 export function itemSwatch(id: string): string {
+  if (id in PUFFLE_COLORS) return pufflePreviewSwatch(id)
   return PENGUIN_COLORS[id] ?? shade('#9fb3c8', 0)
 }

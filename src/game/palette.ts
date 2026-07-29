@@ -37,6 +37,29 @@ export function withAlpha(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }
 
+/**
+ * Soft light falloff — a flat translucent circle reads as a hard disc.
+ * Lives here rather than in scenery.ts so the furniture module can use it
+ * without pulling in the room renderer.
+ */
+export function glow(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  color: string,
+  alpha: number,
+) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r)
+  g.addColorStop(0, withAlpha(color, alpha))
+  g.addColorStop(0.55, withAlpha(color, alpha * 0.4))
+  g.addColorStop(1, withAlpha(color, 0))
+  ctx.fillStyle = g
+  ctx.beginPath()
+  ctx.arc(x, y, r, 0, Math.PI * 2)
+  ctx.fill()
+}
+
 /** Penguin body colours, keyed by the item id that unlocks them. */
 export const PENGUIN_COLORS: Record<string, string> = {
   color_blue: '#3179d8',

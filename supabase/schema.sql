@@ -16,6 +16,10 @@ create table if not exists public.profiles (
   created_at   timestamptz not null default now()
 );
 
+-- Nicknames the player gave their puffles: {"puffle_pink": "Biscuit"}.
+alter table public.profiles
+  add column if not exists puffle_names jsonb not null default '{}'::jsonb;
+
 -- Case-insensitive unique penguin names.
 create unique index if not exists profiles_username_lower_idx
   on public.profiles (lower(username));
@@ -27,12 +31,47 @@ create table if not exists public.items (
   cost  integer not null check (cost >= 0)
 );
 
+-- Puffles, furniture and igloo styles are items too, so one inventory and one
+-- buy_item() covers everything the player can own.
+alter table public.items drop constraint if exists items_slot_check;
+alter table public.items add constraint items_slot_check check (
+  slot in ('color', 'hat', 'shirt', 'neck', 'hand', 'feet', 'puffle', 'furniture', 'igloo')
+);
+
 create table if not exists public.inventory (
   profile_id  uuid not null references public.profiles on delete cascade,
   item_id     text not null references public.items on delete cascade,
   acquired_at timestamptz not null default now(),
   primary key (profile_id, item_id)
 );
+
+-- Every penguin gets an igloo: a private room they decorate and friends visit.
+create table if not exists public.igloos (
+  owner      uuid primary key references public.profiles on delete cascade,
+  style      text not null default 'igloo_classic',
+  items      jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.friend_requests (
+  from_id    uuid not null references public.profiles on delete cascade,
+  to_id      uuid not null references public.profiles on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (from_id, to_id),
+  check (from_id <> to_id)
+);
+
+-- One row per friendship, with the ids stored in a canonical order.
+create table if not exists public.friendships (
+  a          uuid not null references public.profiles on delete cascade,
+  b          uuid not null references public.profiles on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (a, b),
+  check (a < b)
+);
+
+create index if not exists friendships_b_idx on public.friendships (b);
+create index if not exists friend_requests_to_idx on public.friend_requests (to_id);
 
 -- ---------------------------------------------------------------------------
 -- Item catalogue (must stay in sync with src/game/items.ts)
@@ -69,7 +108,39 @@ insert into public.items (id, name, slot, cost) values
   ('hand_rod',         'Fishing Rod',     'hand',  240),
   ('hand_balloon',     'Red Balloon',     'hand',  160),
   ('feet_boots',       'Snow Boots',      'feet',  130),
-  ('feet_skis',        'Tiny Skis',       'feet',  280)
+  ('feet_skis',        'Tiny Skis',       'feet',  280),
+
+  ('puffle_blue',      'Blue Puffle',     'puffle', 200),
+  ('puffle_pink',      'Pink Puffle',     'puffle', 200),
+  ('puffle_green',     'Green Puffle',    'puffle', 250),
+  ('puffle_purple',    'Purple Puffle',   'puffle', 300),
+  ('puffle_red',       'Red Puffle',      'puffle', 350),
+  ('puffle_yellow',    'Yellow Puffle',   'puffle', 400),
+  ('puffle_orange',    'Orange Puffle',   'puffle', 450),
+  ('puffle_white',     'White Puffle',    'puffle', 600),
+  ('puffle_black',     'Black Puffle',    'puffle', 750),
+  ('puffle_rainbow',   'Rainbow Puffle',  'puffle', 1200),
+
+  ('furn_sofa',        'Comfy Sofa',      'furniture', 220),
+  ('furn_armchair',    'Armchair',        'furniture', 160),
+  ('furn_table',       'Round Table',     'furniture', 140),
+  ('furn_lamp',        'Floor Lamp',      'furniture', 120),
+  ('furn_plant',       'Potted Plant',    'furniture', 100),
+  ('furn_tv',          'Television',      'furniture', 380),
+  ('furn_shelf',       'Bookshelf',       'furniture', 260),
+  ('furn_fishtank',    'Fish Tank',       'furniture', 420),
+  ('furn_rug',         'Round Rug',       'furniture', 130),
+  ('furn_fire',        'Fireplace',       'furniture', 480),
+  ('furn_snowman',     'Indoor Snowman',  'furniture', 190),
+  ('furn_speaker',     'Big Speaker',     'furniture', 340),
+  ('furn_throne',      'Golden Throne',   'furniture', 900),
+  ('furn_bed',         'Cosy Bed',        'furniture', 300),
+  ('furn_piano',       'Piano',           'furniture', 700),
+  ('furn_tree',        'Little Pine',     'furniture', 150),
+
+  ('igloo_classic',    'Snow Igloo',      'igloo', 0),
+  ('igloo_cabin',      'Log Cabin',       'igloo', 900),
+  ('igloo_deluxe',     'Ice Palace',      'igloo', 1600)
 on conflict (id) do update
   set name = excluded.name, slot = excluded.slot, cost = excluded.cost;
 
@@ -125,7 +196,7 @@ create trigger guard_profile_update
   before update on public.profiles
   for each row execute function public.guard_profile_update();
 
--- New penguins start owning the free blue colour.
+-- New penguins start owning the free items, and get an empty igloo.
 create or replace function public.grant_starter_items()
 returns trigger
 language plpgsql
@@ -136,9 +207,55 @@ begin
   insert into public.inventory (profile_id, item_id)
   select new.id, id from public.items where cost = 0
   on conflict do nothing;
+
+  insert into public.igloos (owner) values (new.id)
+  on conflict do nothing;
+
   return new;
 end;
 $$;
+
+-- An igloo may only contain furniture its owner actually bought.
+create or replace function public.guard_igloo()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_item text;
+begin
+  if jsonb_typeof(new.items) is distinct from 'array' then
+    raise exception 'Igloo contents must be a JSON array' using errcode = '22023';
+  end if;
+
+  if jsonb_array_length(new.items) > 60 then
+    raise exception 'That is a lot of furniture — 60 pieces maximum' using errcode = '22023';
+  end if;
+
+  for v_item in select value ->> 'item' from jsonb_array_elements(new.items) loop
+    if not exists (select 1 from public.inventory
+                   where profile_id = new.owner and item_id = v_item) then
+      raise exception 'You do not own the furniture %', v_item using errcode = '42501';
+    end if;
+  end loop;
+
+  if new.style is distinct from old.style then
+    if not exists (select 1 from public.inventory
+                   where profile_id = new.owner and item_id = new.style) then
+      raise exception 'You do not own the igloo style %', new.style using errcode = '42501';
+    end if;
+  end if;
+
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists guard_igloo on public.igloos;
+create trigger guard_igloo
+  before update on public.igloos
+  for each row execute function public.guard_igloo();
 
 drop trigger if exists grant_starter_items on public.profiles;
 create trigger grant_starter_items
@@ -264,6 +381,125 @@ exception
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Friends
+-- ---------------------------------------------------------------------------
+
+-- Sending a request back to someone who already asked you accepts it instead.
+create or replace function public.send_friend_request(p_to uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_a uuid;
+  v_b uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'Not signed in' using errcode = '42501';
+  end if;
+  if p_to = auth.uid() then
+    raise exception 'You cannot befriend yourself' using errcode = '22023';
+  end if;
+  if not exists (select 1 from public.profiles where id = p_to) then
+    raise exception 'No such penguin' using errcode = '22023';
+  end if;
+
+  v_a := least(auth.uid(), p_to);
+  v_b := greatest(auth.uid(), p_to);
+
+  if exists (select 1 from public.friendships where a = v_a and b = v_b) then
+    return 'already';
+  end if;
+
+  if exists (select 1 from public.friend_requests
+             where from_id = p_to and to_id = auth.uid()) then
+    delete from public.friend_requests
+     where (from_id = p_to and to_id = auth.uid())
+        or (from_id = auth.uid() and to_id = p_to);
+    insert into public.friendships (a, b) values (v_a, v_b) on conflict do nothing;
+    return 'accepted';
+  end if;
+
+  insert into public.friend_requests (from_id, to_id)
+  values (auth.uid(), p_to)
+  on conflict do nothing;
+  return 'sent';
+end;
+$$;
+
+create or replace function public.accept_friend_request(p_from uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_a uuid;
+  v_b uuid;
+begin
+  if not exists (select 1 from public.friend_requests
+                 where from_id = p_from and to_id = auth.uid()) then
+    raise exception 'No such request' using errcode = '22023';
+  end if;
+  v_a := least(auth.uid(), p_from);
+  v_b := greatest(auth.uid(), p_from);
+  delete from public.friend_requests
+   where (from_id = p_from and to_id = auth.uid())
+      or (from_id = auth.uid() and to_id = p_from);
+  insert into public.friendships (a, b) values (v_a, v_b) on conflict do nothing;
+end;
+$$;
+
+create or replace function public.decline_friend_request(p_from uuid)
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  delete from public.friend_requests where from_id = p_from and to_id = auth.uid();
+$$;
+
+create or replace function public.remove_friend(p_other uuid)
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  delete from public.friendships
+   where a = least(auth.uid(), p_other) and b = greatest(auth.uid(), p_other);
+$$;
+
+create or replace function public.my_friends()
+returns table (id uuid, username text, color text, equipped jsonb)
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select p.id, p.username, p.color, p.equipped
+    from public.friendships f
+    join public.profiles p
+      on p.id = case when f.a = auth.uid() then f.b else f.a end
+   where f.a = auth.uid() or f.b = auth.uid()
+   order by p.username;
+$$;
+
+create or replace function public.my_friend_requests()
+returns table (id uuid, username text, color text, equipped jsonb)
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select p.id, p.username, p.color, p.equipped
+    from public.friend_requests r
+    join public.profiles p on p.id = r.from_id
+   where r.to_id = auth.uid()
+   order by r.created_at;
+$$;
+
 -- Username availability check that doesn't leak the whole profiles table.
 create or replace function public.username_available(p_username text)
 returns boolean
@@ -281,9 +517,12 @@ $$;
 -- Row level security
 -- ---------------------------------------------------------------------------
 
-alter table public.profiles  enable row level security;
-alter table public.items     enable row level security;
-alter table public.inventory enable row level security;
+alter table public.profiles        enable row level security;
+alter table public.items           enable row level security;
+alter table public.inventory       enable row level security;
+alter table public.igloos          enable row level security;
+alter table public.friendships     enable row level security;
+alter table public.friend_requests enable row level security;
 
 drop policy if exists "profiles are public" on public.profiles;
 create policy "profiles are public"
@@ -319,7 +558,40 @@ create policy "read own inventory"
 -- Inventory is written only by buy_item() / grant_starter_items().
 -- No insert/update/delete policies == no direct client writes.
 
-grant execute on function public.create_penguin(text, text)  to authenticated;
+-- Igloos are visitable by anyone, editable only by their owner.
+drop policy if exists "igloos are visitable" on public.igloos;
+create policy "igloos are visitable"
+  on public.igloos for select
+  to authenticated
+  using (true);
+
+drop policy if exists "decorate own igloo" on public.igloos;
+create policy "decorate own igloo"
+  on public.igloos for update
+  to authenticated
+  using (owner = auth.uid())
+  with check (owner = auth.uid());
+
+-- Friendships are readable by either side; all writes go through the RPCs.
+drop policy if exists "read own friendships" on public.friendships;
+create policy "read own friendships"
+  on public.friendships for select
+  to authenticated
+  using (a = auth.uid() or b = auth.uid());
+
+drop policy if exists "read own friend requests" on public.friend_requests;
+create policy "read own friend requests"
+  on public.friend_requests for select
+  to authenticated
+  using (from_id = auth.uid() or to_id = auth.uid());
+
+grant execute on function public.create_penguin(text, text)        to authenticated;
+grant execute on function public.send_friend_request(uuid)         to authenticated;
+grant execute on function public.accept_friend_request(uuid)       to authenticated;
+grant execute on function public.decline_friend_request(uuid)      to authenticated;
+grant execute on function public.remove_friend(uuid)               to authenticated;
+grant execute on function public.my_friends()                      to authenticated;
+grant execute on function public.my_friend_requests()              to authenticated;
 grant execute on function public.award_coins(text, integer)  to authenticated;
 grant execute on function public.buy_item(text)              to authenticated;
 grant execute on function public.username_available(text)    to authenticated;

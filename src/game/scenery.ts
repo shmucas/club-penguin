@@ -1,4 +1,4 @@
-import { mix, shade, withAlpha } from './palette'
+import { glow, mix, shade, withAlpha } from './palette'
 import { WORLD_H, WORLD_W } from './render'
 
 /** Deterministic pseudo-random in [0,1) so scenery never flickers between frames. */
@@ -244,9 +244,11 @@ export function lamppost(ctx: CanvasRenderingContext2D, x: number, y: number, li
   ctx.beginPath()
   ctx.ellipse(x, y, 12, 4, 0, 0, Math.PI * 2)
   ctx.fill()
-  ctx.fillStyle = lit ? '#ffe9a8' : '#dbe7f2'
+  if (lit) glow(ctx, x, y - 100, 66, '#ffe9a8', 0.3)
+  ctx.fillStyle = lit ? '#ffdf94' : '#c3d5e6'
   ctx.strokeStyle = '#3c4a5c'
   ctx.lineWidth = 3
+  ctx.lineJoin = 'round'
   ctx.beginPath()
   ctx.moveTo(x - 11, y - 96)
   ctx.lineTo(x + 11, y - 96)
@@ -255,12 +257,6 @@ export function lamppost(ctx: CanvasRenderingContext2D, x: number, y: number, li
   ctx.closePath()
   ctx.fill()
   ctx.stroke()
-  if (lit) {
-    ctx.fillStyle = withAlpha('#ffe9a8', 0.13)
-    ctx.beginPath()
-    ctx.arc(x, y - 100, 46, 0, Math.PI * 2)
-    ctx.fill()
-  }
   ctx.fillStyle = '#ffffff'
   ctx.beginPath()
   ctx.ellipse(x, y - 117, 9, 4, 0, Math.PI, 0)

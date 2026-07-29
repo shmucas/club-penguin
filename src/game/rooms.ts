@@ -1,4 +1,5 @@
-import type { GameId } from '../lib/types'
+import type { GameId, IglooData } from '../lib/types'
+import { IGLOO_STYLES, IGLOO_STYLES_BY_ID, type PlacedItem } from './furniture'
 import { mix, shade, withAlpha } from './palette'
 import { WORLD_H, WORLD_W } from './render'
 import {
@@ -21,9 +22,11 @@ import {
 } from './scenery'
 
 export type HotspotAction =
-  | { type: 'room'; room: RoomId }
+  | { type: 'room'; room: string }
   | { type: 'game'; game: GameId }
   | { type: 'shop' }
+  | { type: 'puffles' }
+  | { type: 'decorate' }
 
 export interface Hotspot {
   x: number
@@ -35,7 +38,7 @@ export interface Hotspot {
 }
 
 export interface Room {
-  id: RoomId
+  id: string
   name: string
   /** Where penguins may waddle. */
   walk: { x1: number; y1: number; x2: number; y2: number }
@@ -44,6 +47,10 @@ export interface Room {
   paint: (ctx: CanvasRenderingContext2D, t: number) => void
   /** Interiors get a warmer chat panel; used for small UI touches. */
   indoor?: boolean
+  /** Furniture, depth-sorted against penguins by the renderer. */
+  props?: PlacedItem[]
+  /** Set for igloos, so the UI can offer the decorate button to the owner. */
+  iglooOwner?: string
 }
 
 export type RoomId =
@@ -54,6 +61,15 @@ export type RoomId =
   | 'gift-shop'
   | 'coffee-shop'
   | 'night-club'
+
+/** `igloo:<uuid>` rooms are built on demand from the database. */
+export function isIglooRoom(id: string): boolean {
+  return id.startsWith('igloo:')
+}
+
+export function iglooRoomId(ownerId: string): string {
+  return `igloo:${ownerId}`
+}
 
 // ---------------------------------------------------------------------------
 // Town — the hub
@@ -117,6 +133,7 @@ const plaza: Room = {
   spawn: { x: 200, y: 620 },
   hotspots: [
     { x: 20, y: 550, w: 90, h: 150, label: 'To Town', action: { type: 'room', room: 'town' } },
+    { x: 946, y: 420, w: 108, h: 92, label: 'Adopt a Puffle', action: { type: 'puffles' } },
   ],
   paint(ctx, t) {
     sky(ctx, '#7fbdea', '#d8ecfa')
@@ -712,6 +729,99 @@ export const ROOMS: Record<RoomId, Room> = {
 }
 
 export const ROOM_IDS = Object.keys(ROOMS) as RoomId[]
+
+/** Rooms the map lets you jump straight to. */
+export const MAP_ROOMS: Array<{ id: RoomId; blurb: string }> = [
+  { id: 'town', blurb: 'Shops and the way everywhere else' },
+  { id: 'plaza', blurb: 'Pizza, pet shop and the fountain' },
+  { id: 'dock', blurb: 'Boats, crates and ice fishing' },
+  { id: 'ski-hill', blurb: 'Chair lift and the sled run' },
+  { id: 'gift-shop', blurb: 'Clothes and colours' },
+  { id: 'coffee-shop', blurb: 'Warm drinks and Coffee Rush' },
+  { id: 'night-club', blurb: 'Lights, speakers, dancing' },
+]
+
+/**
+ * Builds a Room for somebody's igloo. Furniture is returned as `props` so the
+ * renderer can depth-sort it against the penguins standing in the room.
+ */
+export function buildIglooRoom(data: IglooData): Room {
+  const style = IGLOO_STYLES_BY_ID[data.style] ?? IGLOO_STYLES[0]
+  const floorY = style.floorY
+
+  return {
+    id: iglooRoomId(data.owner),
+    name: `${data.ownerName}'s Igloo`,
+    indoor: true,
+    iglooOwner: data.owner,
+    props: data.items,
+    walk: { x1: 110, y1: floorY + 70, x2: WORLD_W - 110, y2: 690 },
+    spawn: { x: 240, y: floorY + 150 },
+    hotspots: [
+      { x: 60, y: floorY - 190, w: 130, h: 210, label: 'Leave', action: { type: 'room', room: 'town' } },
+    ],
+    paint(ctx, t) {
+      style.paint(ctx, t, WORLD_W, WORLD_H)
+
+      // Front door.
+      const doorTop = floorY - 190
+      ctx.fillStyle = '#5b4130'
+      ctx.beginPath()
+      ctx.roundRect(60, doorTop, 130, 210, [16, 16, 0, 0])
+      ctx.fill()
+      ctx.fillStyle = '#8fd0ea'
+      ctx.beginPath()
+      ctx.roundRect(78, doorTop + 20, 94, 96, 8)
+      ctx.fill()
+      ctx.fillStyle = withAlpha('#ffffff', 0.35)
+      ctx.beginPath()
+      ctx.moveTo(86, doorTop + 112)
+      ctx.lineTo(120, doorTop + 30)
+      ctx.lineTo(136, doorTop + 30)
+      ctx.lineTo(102, doorTop + 112)
+      ctx.closePath()
+      ctx.fill()
+      ctx.fillStyle = '#f0c14b'
+      ctx.beginPath()
+      ctx.arc(172, doorTop + 150, 5, 0, Math.PI * 2)
+      ctx.fill()
+      sign(ctx, 125, doorTop - 34, '← Town', '#2f6f9e')
+
+      // Welcome mat.
+      ctx.fillStyle = withAlpha('#b8524f', 0.85)
+      ctx.beginPath()
+      ctx.ellipse(125, floorY + 46, 76, 22, 0, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.fillStyle = withAlpha('#f4e5c8', 0.9)
+      ctx.font = '700 15px ui-rounded, "Segoe UI", system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText('WELCOME', 125, floorY + 46)
+    },
+  }
+}
+
+/** Placeholder shown for the moment before an igloo's contents arrive. */
+export function loadingIglooRoom(name: string): Room {
+  return {
+    id: 'igloo:loading',
+    name,
+    indoor: true,
+    walk: { x1: 300, y1: 560, x2: 980, y2: 660 },
+    spawn: { x: 640, y: 620 },
+    hotspots: [],
+    paint(ctx) {
+      ctx.fillStyle = '#8fc0e0'
+      ctx.fillRect(0, 0, WORLD_W, WORLD_H)
+      ctx.fillStyle = '#e8f3fb'
+      ctx.fillRect(0, 470, WORLD_W, WORLD_H - 470)
+      ctx.font = '700 28px ui-rounded, "Segoe UI", system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.fillStyle = withAlpha('#0d1f38', 0.5)
+      ctx.fillText('Opening the door…', WORLD_W / 2, 360)
+    },
+  }
+}
 
 export function clampToWalk(room: Room, x: number, y: number) {
   return {

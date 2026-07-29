@@ -15,9 +15,9 @@ function useTitleBackdrop(canvasRef: React.RefObject<HTMLCanvasElement>) {
     if (!ctx) return
 
     const cast: PlayerState[] = [
-      { id: 'a', username: '', color: 'color_red', equipped: { hat: 'hat_beanie', neck: 'neck_scarf' }, x: 300, y: 640, tx: 300, ty: 640, dir: 1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0 },
-      { id: 'b', username: '', color: 'color_green', equipped: { hat: 'hat_propeller' }, x: 980, y: 610, tx: 980, ty: 610, dir: -1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0 },
-      { id: 'c', username: '', color: 'color_yellow', equipped: { neck: 'neck_cape', hand: 'hand_balloon' }, x: 640, y: 680, tx: 640, ty: 680, dir: 1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0 },
+      { id: 'a', username: '', color: 'color_red', equipped: { hat: 'hat_beanie', neck: 'neck_scarf' }, x: 300, y: 640, tx: 300, ty: 640, dir: 1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0, puffleX: 0, puffleY: 0, puffleHop: 0 },
+      { id: 'b', username: '', color: 'color_green', equipped: { hat: 'hat_propeller' }, x: 980, y: 610, tx: 980, ty: 610, dir: -1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0, puffleX: 0, puffleY: 0, puffleHop: 0 },
+      { id: 'c', username: '', color: 'color_yellow', equipped: { neck: 'neck_cape', hand: 'hand_balloon' }, x: 640, y: 680, tx: 640, ty: 680, dir: 1, emote: null, emoteAt: 0, bubble: null, bubbleAt: 0, puffleX: 0, puffleY: 0, puffleHop: 0 },
     ]
 
     let raf = 0

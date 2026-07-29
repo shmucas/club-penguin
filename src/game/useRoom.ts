@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { RealtimeChannel } from '@supabase/supabase-js'
 import { supabase } from '../lib/supabase'
 import type { Equipped, PlayerState, Snowball } from '../lib/types'
-import { ROOMS, type RoomId, clampToWalk } from './rooms'
+import { type Room, clampToWalk } from './rooms'
 import { SNOWBALL_FLIGHT_MS, WALK_SPEED } from './render'
 
 export interface ChatLine {
@@ -41,6 +41,9 @@ function makePlayer(p: Presence): PlayerState {
     emoteAt: 0,
     bubble: null,
     bubbleAt: 0,
+    puffleX: p.x - 34,
+    puffleY: p.y + 8,
+    puffleHop: 0,
   }
 }
 
@@ -49,7 +52,7 @@ function makePlayer(p: Presence): PlayerState {
  * movement, chat, emotes and snowballs. Positions live in refs so the render
  * loop never re-renders React.
  */
-export function useRoom(roomId: RoomId, me: Look | null) {
+export function useRoom(roomId: string, me: Look | null, room: Room) {
   const players = useRef<Map<string, PlayerState>>(new Map())
   const snowballs = useRef<Snowball[]>([])
   const channelRef = useRef<RealtimeChannel | null>(null)
@@ -62,8 +65,13 @@ export function useRoom(roomId: RoomId, me: Look | null) {
 
   meRef.current = me
 
-  const room = ROOMS[roomId]
-  const spawn = useMemo(() => room.spawn, [room])
+  // The room object is rebuilt whenever an igloo is edited, so read it through
+  // a ref: the channel subscription must not tear down on every change.
+  const roomRef = useRef(room)
+  roomRef.current = room
+
+  // Spawn only needs to be re-read when we actually change room.
+  const spawn = useMemo(() => roomRef.current.spawn, [roomId])
 
   useEffect(() => {
     if (!me) return
@@ -217,8 +225,11 @@ export function useRoom(roomId: RoomId, me: Look | null) {
     } satisfies Presence)
   }, [me, spawn.x, spawn.y])
 
-  /** Advance every penguin toward its target. Called once per animation frame. */
+  /** Advance every penguin and its puffle. Called once per animation frame. */
   const step = useCallback((dt: number) => {
+    const now = performance.now()
+    const t = now / 1000
+
     for (const p of players.current.values()) {
       const dx = p.tx - p.x
       const dy = p.ty - p.y
@@ -226,13 +237,32 @@ export function useRoom(roomId: RoomId, me: Look | null) {
       if (dist < 1) {
         p.x = p.tx
         p.y = p.ty
-        continue
+      } else {
+        const move = Math.min(dist, WALK_SPEED * dt)
+        p.x += (dx / dist) * move
+        p.y += (dy / dist) * move
       }
-      const move = Math.min(dist, WALK_SPEED * dt)
-      p.x += (dx / dist) * move
-      p.y += (dy / dist) * move
+
+      // The puffle trails a little behind and to one side of its owner.
+      if (p.equipped.puffle) {
+        const goalX = p.x - p.dir * 36
+        const goalY = p.y + 9
+        const pdx = goalX - p.puffleX
+        const pdy = goalY - p.puffleY
+        const pdist = Math.hypot(pdx, pdy)
+        if (pdist > 5) {
+          // Slightly faster than a penguin, so it can catch up after a long walk.
+          const move = Math.min(pdist, WALK_SPEED * 1.25 * dt)
+          p.puffleX += (pdx / pdist) * move
+          p.puffleY += (pdy / pdist) * move
+          p.puffleHop = Math.abs(Math.sin(t * 9))
+        } else {
+          // Idle: a slow, contented bob.
+          p.puffleHop = Math.max(0, Math.sin(t * 1.6)) * 0.22
+        }
+      }
     }
-    const now = performance.now()
+
     snowballs.current = snowballs.current.filter((s) => now - s.start < SNOWBALL_FLIGHT_MS + 400)
   }, [])
 
@@ -242,7 +272,7 @@ export function useRoom(roomId: RoomId, me: Look | null) {
       if (!m) return
       const self = players.current.get(m.id)
       if (!self) return
-      const target = clampToWalk(ROOMS[roomId], x, y)
+      const target = clampToWalk(roomRef.current, x, y)
       self.tx = target.x
       self.ty = target.y
       if (Math.abs(target.x - self.x) > 4) self.dir = target.x > self.x ? 1 : -1

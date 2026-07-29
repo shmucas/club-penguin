@@ -1,6 +1,7 @@
 import type { PlayerState, Snowball } from '../lib/types'
 import { ITEMS_BY_ID, P } from './items'
 import { bodyColor, shade, withAlpha } from './palette'
+import { drawPuffle } from './puffles'
 
 export const WORLD_W = 1280
 export const WORLD_H = 720
@@ -190,6 +191,14 @@ function drawNameTag(ctx: CanvasRenderingContext2D, p: PlayerState, self: boolea
   ctx.restore()
 }
 
+/** Draws the puffle trailing after a penguin, if it has one out. */
+export function drawPlayerPuffle(ctx: CanvasRenderingContext2D, p: PlayerState, now: number) {
+  const id = p.equipped.puffle
+  if (!id) return
+  const dir: 1 | -1 = p.x >= p.puffleX ? 1 : -1
+  drawPuffle(ctx, id, p.puffleX, p.puffleY, now / 1000, p.puffleHop, dir)
+}
+
 /** Speech bubbles are drawn in a second pass so they never sit behind a penguin. */
 export function drawBubble(ctx: CanvasRenderingContext2D, p: PlayerState, now: number) {
   if (!p.bubble || now - p.bubbleAt > BUBBLE_MS) return
@@ -325,6 +334,9 @@ export function drawPenguinPreview(
       emoteAt: 0,
       bubble: null,
       bubbleAt: 0,
+      puffleX: 0,
+      puffleY: 0,
+      puffleHop: 0,
     },
     now,
     { showName: false },

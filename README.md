@@ -83,10 +83,29 @@ rather than teleport.
 | Ice Fishing | The Dock | 70 seconds to hook fish and avoid jellyfish. |
 | Coffee Rush | Coffee Shop | Catch falling sacks in a cart. Drop three and you're out. |
 
-**The Gift Shop** — 31 items across colours, hats, shirts, neck items, hand-held
-props and shoes. Every tile shows a live penguin actually wearing the item.
-Buying and wearing both go through the database, so other players see your
-outfit immediately.
+**The Gift Shop** — colours, hats, shirts, neck items, hand-held props, shoes,
+puffles, furniture and igloo styles: 60 things to buy. Every tile shows a live
+preview of the actual item. Buying and wearing both go through the database, so
+other players see your outfit immediately.
+
+**Puffles** — adopt a pet from Snow Pets in the Plaza and it follows you from
+room to room, hopping to keep up and bobbing while you stand still. Ten
+colours, and you can give yours a name.
+
+**Igloos** — everybody gets one. Press **Decorate** in your own igloo to place
+furniture: click a piece from the tray, click the floor to put it down, drag to
+move it, Delete to put it away. There are 16 pieces of furniture and three igloo
+styles (Snow Igloo, Log Cabin, Ice Palace). Friends can walk into your igloo and
+see exactly how you arranged it.
+
+**Player cards** — click any penguin to see their card: what they're wearing,
+their puffle, a button to add them as a friend and a button to visit their igloo.
+
+**Friends** — send and accept requests, then see which of your friends are
+online and which room they're in. "Join" walks you straight to them.
+
+**The map** — press `M` for the island map, with a live count of how many
+penguins are in each room, plus a shortcut home to your igloo.
 
 ## Controls
 
@@ -98,7 +117,11 @@ outfit immediately.
 | `D` | Dance |
 | `S` | Sit |
 | `T` | Snowball mode — then click to throw |
+| `M` | Island map |
+| `F` | Friends list |
 | `Esc` | Cancel / close |
+
+Click another penguin to open their player card.
 
 ## How cheating is prevented
 
@@ -108,9 +131,13 @@ outfit immediately.
 - `award_coins()` caps each game's payout and refuses to pay out more than once
   every 15 seconds.
 - You can only wear items in your `inventory`, enforced by a trigger rather than
-  by the UI.
+  by the UI. The same trigger guards igloos: you cannot place furniture or pick
+  an igloo style you haven't bought.
 - The `inventory` table has no insert policy, so rows appear only via
   `buy_item()`.
+- Friendships have no write policies either — they move only through
+  `send_friend_request()`, `accept_friend_request()` and `remove_friend()`, so
+  nobody can add themselves to your friends list.
 
 A determined player could still inflate a game score up to the per-game cap —
 stopping that properly means simulating the game on a server, which is exactly
@@ -122,20 +149,29 @@ the memory cost we were avoiding.
 src/
   game/
     items.ts      Item catalogue + the drawing code for every hat, shirt, etc.
-    palette.ts    Colour helpers and penguin body colours
+    furniture.ts  Igloo furniture and the three igloo styles
+    puffles.ts    Puffle drawing and colours
+    palette.ts    Colour helpers, penguin body colours, light falloff
     render.ts     Penguin drawing, speech bubbles, snowballs
-    rooms.ts      The seven rooms: art, walkable area, clickable hotspots
+    rooms.ts      The seven rooms plus the igloo builder
     scenery.ts    Reusable scenery: mountains, buildings, water, snowfall…
     useRoom.ts    Realtime presence + broadcast for one room
+    useIsland.ts  Island-wide presence: who's online and where
   components/
     Auth.tsx      Login / signup over an animated title scene
     CreatePenguin.tsx
-    World.tsx     The main view: canvas loop, chat, HUD
+    World.tsx     The main view: canvas loop, chat, HUD, igloo editing
     Shop.tsx      Wardrobe and shop
+    PlayerCard.tsx / FriendsPanel.tsx / MapPanel.tsx / IglooEditor.tsx
     games/        The three minigames
 supabase/
   schema.sql      Tables, item catalogue, RPCs, triggers, RLS — run this first
 ```
+
+Note that `furniture.ts` deliberately imports only from `palette.ts`. Reaching
+for `scenery.ts` there creates an import cycle
+(`furniture → scenery → render → items → furniture`) that leaves `FURNITURE`
+uninitialised at module load.
 
 ## Notes
 
