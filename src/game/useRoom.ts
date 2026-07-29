@@ -163,6 +163,8 @@ export function useRoom(roomId: string, me: Look | null, room: Room) {
       }
       setConnected(true)
     } catch {
+      // Put the events back so a dropped poll does not eat a chat message.
+      outbox.current = [...events, ...outbox.current]
       setConnected(false)
     } finally {
       inFlight.current = false
