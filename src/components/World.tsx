@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { supabase } from '../lib/supabase'
+import { getIgloo, saveIgloo as saveIglooApi } from '../lib/api'
 import type {
   Equipped,
   FriendSummary,
@@ -121,16 +121,11 @@ export function World({
     const owner = roomId.slice('igloo:'.length)
     let cancelled = false
     void (async () => {
-      const [{ data: ig }, { data: prof }] = await Promise.all([
-        supabase.from('igloos').select('owner, style, items').eq('owner', owner).maybeSingle(),
-        supabase.from('profiles').select('username').eq('id', owner).maybeSingle(),
-      ])
+      const ig = await getIgloo(owner)
       if (cancelled) return
       setIglooData({
-        owner,
-        ownerName: prof?.username ?? 'Someone',
-        style: (ig?.style as string) ?? 'igloo_classic',
-        items: ((ig?.items ?? []) as PlacedItem[]).filter((i) => FURNITURE_BY_ID[i.item]),
+        ...ig,
+        items: (ig.items as PlacedItem[]).filter((i) => FURNITURE_BY_ID[i.item]),
       })
     })()
     return () => {
@@ -162,7 +157,7 @@ export function World({
 
   const { players, snowballs, step, moveTo, say, doEmote, throwSnowball, online, chatLog, connected } =
     useRoom(roomId, me, room)
-  const island = useIsland(me, roomId, room.name)
+  const island = useIsland(me)
 
   const snowballRef = useRef(snowballMode)
   snowballRef.current = snowballMode
@@ -441,17 +436,15 @@ export function World({
   const saveIgloo = async () => {
     setSaving(true)
     setIglooError(null)
-    const { error } = await supabase
-      .from('igloos')
-      .update({ style: draftStyle, items: draft })
-      .eq('owner', profile.id)
-    setSaving(false)
-    if (error) {
-      setIglooError(error.message)
-      return
+    try {
+      await saveIglooApi(draftStyle, draft)
+      setIglooData((d) => (d ? { ...d, items: draft, style: draftStyle } : d))
+      setDirty(false)
+    } catch (err) {
+      setIglooError(err instanceof Error ? err.message : 'Could not save your igloo.')
+    } finally {
+      setSaving(false)
     }
-    setIglooData((d) => (d ? { ...d, items: draft, style: draftStyle } : d))
-    setDirty(false)
   }
 
   const goHome = () => {

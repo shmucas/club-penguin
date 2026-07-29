@@ -1,32 +1,34 @@
-/** Shown when the Supabase env vars are missing, instead of a blank white page. */
+/** Shown when /api/auth fails, instead of a blank white page. */
 export function Setup() {
   return (
     <div className="setup">
       <div className="setup-card">
         <h1>Almost there</h1>
         <p>
-          Snowfall Island needs a Supabase project to store penguins and carry chat between players.
-          Two environment variables are missing:
+          Snowfall Island could not reach its API. It needs a Neon Postgres database to store
+          penguins and carry chat between players, and two environment variables:
         </p>
         <pre>
-          {'VITE_SUPABASE_URL=https://your-project-ref.supabase.co\nVITE_SUPABASE_ANON_KEY=your-anon-public-key'}
+          {'DATABASE_URL=postgresql://user:password@host.neon.tech/neondb?sslmode=require\nSESSION_SECRET=a-long-random-string'}
         </pre>
         <ol>
           <li>
-            Create a free project at <strong>supabase.com</strong>.
+            Create a free project at <strong>neon.com</strong> and copy its connection string.
           </li>
           <li>
-            Run <code>supabase/schema.sql</code> in the SQL Editor.
+            Run <code>db/schema.sql</code> once: <code>npm run db:push</code>.
           </li>
           <li>
-            Copy the Project URL and the <em>anon public</em> key from Project Settings → API.
+            Generate a session secret: <code>openssl rand -hex 32</code>.
           </li>
           <li>
-            Put them in <code>.env.local</code> for local dev, and in Vercel → Settings → Environment
-            Variables for the deployed site.
+            Put both in <code>.env.local</code> for local dev, and in Vercel → Settings →
+            Environment Variables for the deployed site.
           </li>
         </ol>
-        <p className="muted">Restart the dev server after adding them.</p>
+        <p className="muted">
+          Locally the API routes only run under <code>vercel dev</code>, not <code>vite</code>.
+        </p>
       </div>
     </div>
   )

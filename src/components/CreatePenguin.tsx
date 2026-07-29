@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { supabase } from '../lib/supabase'
+import { createPenguin } from '../lib/api'
 import { drawPenguinPreview } from '../game/render'
 import { PENGUIN_COLORS } from '../game/palette'
 import { ITEMS_BY_ID } from '../game/items'
 
 interface Props {
-  userId: string
   onCreated: () => void
   onSignOut: () => void
 }
@@ -38,20 +37,17 @@ export function CreatePenguin({ onCreated, onSignOut }: Props) {
     }
     setBusy(true)
     setError(null)
-    const { error: rpcError } = await supabase.rpc('create_penguin', {
-      p_username: name,
-      p_color: color,
-    })
-    setBusy(false)
-    if (rpcError) {
+    try {
+      await createPenguin(name, color)
+      onCreated()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Something went wrong.'
       setError(
-        rpcError.message.includes('taken') || rpcError.code === '23505'
-          ? 'That name is already waddling around. Try another.'
-          : rpcError.message,
+        message.includes('taken') ? 'That name is already waddling around. Try another.' : message,
       )
-      return
+    } finally {
+      setBusy(false)
     }
-    onCreated()
   }
 
   return (

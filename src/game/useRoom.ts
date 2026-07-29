@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { RealtimeChannel } from '@supabase/supabase-js'
-import { supabase } from '../lib/supabase'
+import { roomSync, type OutgoingEvent, type RoomPlayer } from '../lib/api'
 import type { Equipped, PlayerState, Snowball } from '../lib/types'
 import { type Room, clampToWalk } from './rooms'
 import { SNOWBALL_FLIGHT_MS, WALK_SPEED } from './render'
+
+/** How often we publish our position and pick up everyone else's. */
+const SYNC_MS = 500
+/** Chat, emotes and snowballs go out sooner than that, but not faster than this. */
+const NUDGE_MS = 150
 
 export interface ChatLine {
   id: string
@@ -19,14 +23,7 @@ interface Look {
   equipped: Equipped
 }
 
-/** Presence payload — just enough for a newcomer to draw everyone correctly. */
-interface Presence extends Look {
-  x: number
-  y: number
-  dir: 1 | -1
-}
-
-function makePlayer(p: Presence): PlayerState {
+function makePlayer(p: RoomPlayer): PlayerState {
   return {
     id: p.id,
     username: p.username,
@@ -34,8 +31,8 @@ function makePlayer(p: Presence): PlayerState {
     equipped: p.equipped ?? {},
     x: p.x,
     y: p.y,
-    tx: p.x,
-    ty: p.y,
+    tx: p.tx ?? p.x,
+    ty: p.ty ?? p.y,
     dir: p.dir ?? 1,
     emote: null,
     emoteAt: 0,
@@ -48,16 +45,24 @@ function makePlayer(p: Presence): PlayerState {
 }
 
 /**
- * Joins one room's realtime channel: presence for who's here, broadcast for
- * movement, chat, emotes and snowballs. Positions live in refs so the render
- * loop never re-renders React.
+ * Keeps one room in sync with the server: who is here, where they are walking,
+ * and what they said. A single POST /api/room per tick both publishes our own
+ * position and returns the roster plus every event since our cursor, so a busy
+ * room is still one request per client per tick.
+ *
+ * Positions live in refs so the render loop never re-renders React.
  */
 export function useRoom(roomId: string, me: Look | null, room: Room) {
   const players = useRef<Map<string, PlayerState>>(new Map())
   const snowballs = useRef<Snowball[]>([])
-  const channelRef = useRef<RealtimeChannel | null>(null)
   const meRef = useRef<Look | null>(me)
   const snowballId = useRef(0)
+
+  // Events waiting for the next tick, and the highest event id we have applied.
+  const outbox = useRef<OutgoingEvent[]>([])
+  const since = useRef(-1)
+  const inFlight = useRef(false)
+  const nudge = useRef(0)
 
   const [online, setOnline] = useState(0)
   const [chatLog, setChatLog] = useState<ChatLine[]>([])
@@ -66,12 +71,115 @@ export function useRoom(roomId: string, me: Look | null, room: Room) {
   meRef.current = me
 
   // The room object is rebuilt whenever an igloo is edited, so read it through
-  // a ref: the channel subscription must not tear down on every change.
+  // a ref: the sync loop must not restart on every change.
   const roomRef = useRef(room)
   roomRef.current = room
 
   // Spawn only needs to be re-read when we actually change room.
   const spawn = useMemo(() => roomRef.current.spawn, [roomId])
+
+  /** One round trip: publish us, apply the roster and the new events. */
+  const sync = useCallback(async () => {
+    const m = meRef.current
+    if (!m || inFlight.current) return
+    const self = players.current.get(m.id)
+    if (!self) return
+
+    const events = outbox.current
+    outbox.current = []
+    inFlight.current = true
+    try {
+      const result = await roomSync({
+        roomId,
+        roomName: roomRef.current.name,
+        x: Math.round(self.x),
+        y: Math.round(self.y),
+        tx: Math.round(self.tx),
+        ty: Math.round(self.ty),
+        dir: self.dir,
+        since: since.current,
+        events,
+      })
+      since.current = result.lastId
+
+      // Roster: identity and looks come from here, and so do the positions of
+      // penguins we have not met yet.
+      const seen = new Set<string>([m.id])
+      for (const p of result.players) {
+        if (p.id === m.id) continue
+        seen.add(p.id)
+        const known = players.current.get(p.id)
+        if (known) {
+          known.username = p.username
+          known.color = p.color
+          known.equipped = p.equipped ?? {}
+          // Trust the roster for the walk target too: it is written by the same
+          // poll that carries move events, so it never lags behind them.
+          known.tx = p.tx
+          known.ty = p.ty
+          known.dir = p.dir
+        } else {
+          players.current.set(p.id, makePlayer(p))
+        }
+      }
+      for (const key of [...players.current.keys()]) {
+        if (!seen.has(key)) players.current.delete(key)
+      }
+      setOnline(players.current.size)
+
+      const now = performance.now()
+      for (const event of result.events) {
+        const p = players.current.get(event.from)
+        const payload = event.payload
+        if (event.kind === 'move') {
+          if (!p) continue
+          p.tx = Number(payload.tx)
+          p.ty = Number(payload.ty)
+          p.dir = payload.dir === -1 ? -1 : 1
+        } else if (event.kind === 'chat') {
+          const text = String(payload.text ?? '')
+          if (!text) continue
+          if (p) {
+            p.bubble = text
+            p.bubbleAt = now
+          }
+          setChatLog((log) =>
+            [...log, { id: event.from, name: payload.name, text, at: Date.now() }].slice(-60),
+          )
+        } else if (event.kind === 'emote') {
+          if (!p) continue
+          p.emote = String(payload.emote ?? '')
+          p.emoteAt = now
+        } else if (event.kind === 'snowball') {
+          snowballs.current.push({
+            id: ++snowballId.current,
+            fromX: Number(payload.fromX),
+            fromY: Number(payload.fromY),
+            toX: Number(payload.toX),
+            toY: Number(payload.toY),
+            start: now,
+          })
+        }
+      }
+      setConnected(true)
+    } catch {
+      setConnected(false)
+    } finally {
+      inFlight.current = false
+    }
+  }, [roomId])
+
+  /** Send soon rather than on the next tick, for chat and other one-offs. */
+  const send = useCallback(
+    (event: OutgoingEvent) => {
+      outbox.current.push(event)
+      const now = performance.now()
+      if (now - nudge.current < NUDGE_MS) return
+      nudge.current = now
+      void sync()
+    },
+    [sync],
+  )
 
   useEffect(() => {
     if (!me) return
@@ -86,144 +194,37 @@ export function useRoom(roomId: string, me: Look | null, room: Room) {
       equipped: me.equipped,
       x: spawn.x,
       y: spawn.y,
+      tx: spawn.x,
+      ty: spawn.y,
       dir: existing?.dir ?? 1,
     })
     players.current = new Map([[myId, self]])
     snowballs.current = []
+    outbox.current = []
+    since.current = -1
     setChatLog([])
+    setConnected(false)
 
-    const channel = supabase.channel(`room:${roomId}`, {
-      config: { presence: { key: myId }, broadcast: { self: false } },
-    })
-    channelRef.current = channel
-
-    channel.on('presence', { event: 'sync' }, () => {
-      const state = channel.presenceState<Presence>()
-      const seen = new Set<string>()
-      for (const [key, entries] of Object.entries(state)) {
-        const p = entries[0]
-        if (!p || !p.username) continue
-        seen.add(key)
-        if (key === myId) continue
-        const known = players.current.get(key)
-        if (known) {
-          // Trust presence for identity/looks, not for position — broadcasts
-          // are more current than the last keepalive.
-          known.username = p.username
-          known.color = p.color
-          known.equipped = p.equipped ?? {}
-        } else {
-          players.current.set(key, makePlayer(p))
-        }
-      }
-      for (const key of [...players.current.keys()]) {
-        if (!seen.has(key) && key !== myId) players.current.delete(key)
-      }
-      setOnline(players.current.size)
-    })
-
-    channel.on('broadcast', { event: 'move' }, ({ payload }) => {
-      const p = players.current.get(payload.id)
-      if (!p) return
-      p.tx = payload.tx
-      p.ty = payload.ty
-      p.dir = payload.dir
-    })
-
-    channel.on('broadcast', { event: 'chat' }, ({ payload }) => {
-      const p = players.current.get(payload.id)
-      const now = performance.now()
-      if (p) {
-        p.bubble = payload.text
-        p.bubbleAt = now
-      }
-      setChatLog((log) =>
-        [...log, { id: payload.id, name: payload.name, text: payload.text, at: Date.now() }].slice(-60),
-      )
-    })
-
-    channel.on('broadcast', { event: 'emote' }, ({ payload }) => {
-      const p = players.current.get(payload.id)
-      if (!p) return
-      p.emote = payload.emote
-      p.emoteAt = performance.now()
-    })
-
-    channel.on('broadcast', { event: 'snowball' }, ({ payload }) => {
-      snowballs.current.push({
-        id: ++snowballId.current,
-        fromX: payload.fromX,
-        fromY: payload.fromY,
-        toX: payload.toX,
-        toY: payload.toY,
-        start: performance.now(),
-      })
-    })
-
-    channel.subscribe(async (status) => {
-      if (status === 'SUBSCRIBED') {
-        setConnected(true)
-        const s = players.current.get(myId)
-        await channel.track({
-          id: myId,
-          username: me.username,
-          color: me.color,
-          equipped: me.equipped,
-          x: s?.x ?? spawn.x,
-          y: s?.y ?? spawn.y,
-          dir: s?.dir ?? 1,
-        } satisfies Presence)
-      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-        setConnected(false)
-      }
-    })
-
-    // Keepalive: refresh our presence position so people who join later see us
-    // in roughly the right place.
-    const keepalive = window.setInterval(() => {
-      const s = players.current.get(myId)
-      const m = meRef.current
-      if (!s || !m) return
-      void channel.track({
-        id: myId,
-        username: m.username,
-        color: m.color,
-        equipped: m.equipped,
-        x: Math.round(s.x),
-        y: Math.round(s.y),
-        dir: s.dir,
-      } satisfies Presence)
-    }, 4000)
-
+    void sync()
+    const timer = window.setInterval(() => void sync(), SYNC_MS)
     return () => {
-      window.clearInterval(keepalive)
+      window.clearInterval(timer)
       setConnected(false)
-      channelRef.current = null
-      void supabase.removeChannel(channel)
     }
-    // `me` identity changes (new clothes) are pushed via the effect below.
+    // `me` identity changes (new clothes) reach everyone through the roster.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, me?.id])
+  }, [roomId, me?.id, sync])
 
-  // Push wardrobe changes to everyone without rejoining the channel.
+  // Keep our own penguin's looks current; the roster carries them to everyone
+  // else on the next tick.
   useEffect(() => {
-    if (!me || !channelRef.current) return
+    if (!me) return
     const s = players.current.get(me.id)
-    if (s) {
-      s.color = me.color
-      s.equipped = me.equipped
-      s.username = me.username
-    }
-    void channelRef.current.track({
-      id: me.id,
-      username: me.username,
-      color: me.color,
-      equipped: me.equipped,
-      x: Math.round(s?.x ?? spawn.x),
-      y: Math.round(s?.y ?? spawn.y),
-      dir: s?.dir ?? 1,
-    } satisfies Presence)
-  }, [me, spawn.x, spawn.y])
+    if (!s) return
+    s.color = me.color
+    s.equipped = me.equipped
+    s.username = me.username
+  }, [me])
 
   /** Advance every penguin and its puffle. Called once per animation frame. */
   const step = useCallback((dt: number) => {
@@ -276,63 +277,65 @@ export function useRoom(roomId: string, me: Look | null, room: Room) {
       self.tx = target.x
       self.ty = target.y
       if (Math.abs(target.x - self.x) > 4) self.dir = target.x > self.x ? 1 : -1
-      void channelRef.current?.send({
-        type: 'broadcast',
-        event: 'move',
-        payload: { id: m.id, tx: Math.round(target.x), ty: Math.round(target.y), dir: self.dir },
+      send({
+        kind: 'move',
+        payload: { tx: Math.round(target.x), ty: Math.round(target.y), dir: self.dir },
       })
     },
-    [roomId],
+    [send],
   )
 
-  const say = useCallback((text: string) => {
-    const m = meRef.current
-    if (!m) return
-    const clean = text.trim().slice(0, 120)
-    if (!clean) return
-    const self = players.current.get(m.id)
-    if (self) {
-      self.bubble = clean
-      self.bubbleAt = performance.now()
-    }
-    setChatLog((log) => [...log, { id: m.id, name: m.username, text: clean, at: Date.now() }].slice(-60))
-    void channelRef.current?.send({
-      type: 'broadcast',
-      event: 'chat',
-      payload: { id: m.id, name: m.username, text: clean },
-    })
-  }, [])
+  const say = useCallback(
+    (text: string) => {
+      const m = meRef.current
+      if (!m) return
+      const clean = text.trim().slice(0, 120)
+      if (!clean) return
+      const self = players.current.get(m.id)
+      if (self) {
+        self.bubble = clean
+        self.bubbleAt = performance.now()
+      }
+      setChatLog((log) =>
+        [...log, { id: m.id, name: m.username, text: clean, at: Date.now() }].slice(-60),
+      )
+      send({ kind: 'chat', payload: { text: clean } })
+    },
+    [send],
+  )
 
-  const doEmote = useCallback((emote: string) => {
-    const m = meRef.current
-    if (!m) return
-    const self = players.current.get(m.id)
-    if (self) {
-      self.emote = emote
-      self.emoteAt = performance.now()
-    }
-    void channelRef.current?.send({
-      type: 'broadcast',
-      event: 'emote',
-      payload: { id: m.id, emote },
-    })
-  }, [])
+  const doEmote = useCallback(
+    (emote: string) => {
+      const m = meRef.current
+      if (!m) return
+      const self = players.current.get(m.id)
+      if (self) {
+        self.emote = emote
+        self.emoteAt = performance.now()
+      }
+      send({ kind: 'emote', payload: { emote } })
+    },
+    [send],
+  )
 
-  const throwSnowball = useCallback((toX: number, toY: number) => {
-    const m = meRef.current
-    if (!m) return
-    const self = players.current.get(m.id)
-    if (!self) return
-    if (Math.abs(toX - self.x) > 6) self.dir = toX > self.x ? 1 : -1
-    const payload = {
-      fromX: Math.round(self.x),
-      fromY: Math.round(self.y),
-      toX: Math.round(toX),
-      toY: Math.round(toY),
-    }
-    snowballs.current.push({ id: ++snowballId.current, ...payload, start: performance.now() })
-    void channelRef.current?.send({ type: 'broadcast', event: 'snowball', payload })
-  }, [])
+  const throwSnowball = useCallback(
+    (toX: number, toY: number) => {
+      const m = meRef.current
+      if (!m) return
+      const self = players.current.get(m.id)
+      if (!self) return
+      if (Math.abs(toX - self.x) > 6) self.dir = toX > self.x ? 1 : -1
+      const payload = {
+        fromX: Math.round(self.x),
+        fromY: Math.round(self.y),
+        toX: Math.round(toX),
+        toY: Math.round(toY),
+      }
+      snowballs.current.push({ id: ++snowballId.current, ...payload, start: performance.now() })
+      send({ kind: 'snowball', payload })
+    },
+    [send],
+  )
 
   return { players, snowballs, step, moveTo, say, doEmote, throwSnowball, online, chatLog, connected }
 }

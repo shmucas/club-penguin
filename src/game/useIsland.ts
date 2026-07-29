@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
-import type { RealtimeChannel } from '@supabase/supabase-js'
-import { supabase } from '../lib/supabase'
+import { useEffect, useState } from 'react'
+import { islandOnline } from '../lib/api'
 import type { Equipped } from '../lib/types'
+
+/** Polled slowly: it only feeds the map's room counts and the online dots. */
+const POLL_MS = 3000
 
 export interface IslandPresence {
   id: string
@@ -13,71 +15,38 @@ export interface IslandPresence {
 }
 
 /**
- * One island-wide presence channel, separate from the per-room ones. It answers
- * "who is online and which room are they in", which powers the friends list and
- * the map's room counts.
+ * Who is online and which room they are in. Our own row is published by the
+ * room sync (see useRoom), so this hook only reads.
  */
-export function useIsland(
-  me: { id: string; username: string; color: string; equipped: Equipped } | null,
-  room: string,
-  roomName: string,
-) {
+export function useIsland(me: { id: string } | null) {
   const [online, setOnline] = useState<Record<string, IslandPresence>>({})
-  const channelRef = useRef<RealtimeChannel | null>(null)
-  const latest = useRef({ me, room, roomName })
-  latest.current = { me, room, roomName }
 
   useEffect(() => {
     if (!me) return
-    const myId = me.id
-    const channel = supabase.channel('island', {
-      config: { presence: { key: myId }, broadcast: { self: false } },
-    })
-    channelRef.current = channel
+    let cancelled = false
 
-    channel.on('presence', { event: 'sync' }, () => {
-      const state = channel.presenceState<IslandPresence>()
-      const next: Record<string, IslandPresence> = {}
-      for (const [key, entries] of Object.entries(state)) {
-        const p = entries[0]
-        if (p?.username) next[key] = p
+    const poll = async () => {
+      try {
+        const { online: rows } = await islandOnline()
+        if (cancelled) return
+        const next: Record<string, IslandPresence> = {}
+        for (const row of rows) {
+          if (row.username) next[row.id] = { ...row, equipped: row.equipped ?? {} }
+        }
+        setOnline(next)
+      } catch {
+        // A dropped poll is harmless: the next one is three seconds away.
       }
-      setOnline(next)
-    })
+    }
 
-    channel.subscribe(async (status) => {
-      if (status !== 'SUBSCRIBED') return
-      const l = latest.current
-      if (!l.me) return
-      await channel.track({
-        id: l.me.id,
-        username: l.me.username,
-        color: l.me.color,
-        equipped: l.me.equipped,
-        room: l.room,
-        roomName: l.roomName,
-      } satisfies IslandPresence)
-    })
-
+    void poll()
+    const timer = window.setInterval(() => void poll(), POLL_MS)
     return () => {
-      channelRef.current = null
-      void supabase.removeChannel(channel)
+      cancelled = true
+      window.clearInterval(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.id])
-
-  // Re-announce whenever we change room or outfit.
-  useEffect(() => {
-    if (!me || !channelRef.current) return
-    void channelRef.current.track({
-      id: me.id,
-      username: me.username,
-      color: me.color,
-      equipped: me.equipped,
-      room,
-      roomName,
-    } satisfies IslandPresence)
-  }, [me, room, roomName])
 
   return { online, count: Object.keys(online).length }
 }

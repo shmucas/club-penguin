@@ -1,24 +1,42 @@
--- Snowfall Island — full database schema.
--- Paste this whole file into the Supabase SQL Editor and run it once.
+-- Snowfall Island - full database schema for Neon Postgres.
+-- Run once: npm run db:push (or paste into the Neon SQL Editor).
 -- It is idempotent: re-running it is safe.
+--
+-- There is no row level security here. Nothing connects to this database except
+-- the API routes in /api, which run as the owner. Every rule that used to be a
+-- policy is now either an explicit filter in the route or a check in one of the
+-- functions below. The functions take the acting player as `p_actor`, which the
+-- routes read from the signed session cookie and never from the request body.
+
+create extension if not exists pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- Accounts
+-- ---------------------------------------------------------------------------
+
+create table if not exists public.users (
+  id            uuid primary key default gen_random_uuid(),
+  email         text not null,
+  password_hash text not null,
+  created_at    timestamptz not null default now()
+);
+
+create unique index if not exists users_email_lower_idx on public.users (lower(email));
 
 -- ---------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------
 
 create table if not exists public.profiles (
-  id           uuid primary key references auth.users on delete cascade,
+  id           uuid primary key references public.users on delete cascade,
   username     text not null check (char_length(username) between 3 and 16),
   color        text not null default 'color_blue',
   coins        integer not null default 500 check (coins >= 0),
   equipped     jsonb not null default '{}'::jsonb,
+  puffle_names jsonb not null default '{}'::jsonb,
   last_award   timestamptz not null default (now() - interval '1 hour'),
   created_at   timestamptz not null default now()
 );
-
--- Nicknames the player gave their puffles: {"puffle_pink": "Biscuit"}.
-alter table public.profiles
-  add column if not exists puffle_names jsonb not null default '{}'::jsonb;
 
 -- Case-insensitive unique penguin names.
 create unique index if not exists profiles_username_lower_idx
@@ -27,7 +45,7 @@ create unique index if not exists profiles_username_lower_idx
 create table if not exists public.items (
   id    text primary key,
   name  text not null,
-  slot  text not null check (slot in ('color', 'hat', 'shirt', 'neck', 'hand', 'feet')),
+  slot  text not null,
   cost  integer not null check (cost >= 0)
 );
 
@@ -72,6 +90,38 @@ create table if not exists public.friendships (
 
 create index if not exists friendships_b_idx on public.friendships (b);
 create index if not exists friend_requests_to_idx on public.friend_requests (to_id);
+
+-- ---------------------------------------------------------------------------
+-- Multiplayer: presence and a short-lived event log, polled by the client
+-- ---------------------------------------------------------------------------
+
+-- Where each penguin is right now. One row per player, overwritten on poll.
+create table if not exists public.presence (
+  profile_id uuid primary key references public.profiles on delete cascade,
+  room_id    text not null,
+  room_name  text not null,
+  x          integer not null,
+  y          integer not null,
+  tx         integer not null,
+  ty         integer not null,
+  dir        smallint not null default 1,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists presence_room_idx on public.presence (room_id, updated_at);
+
+-- Movement, chat, emotes and snowballs. Rows live for seconds: clients read
+-- everything newer than the last id they saw, then the log is trimmed.
+create table if not exists public.room_events (
+  id         bigserial primary key,
+  room_id    text not null,
+  from_id    uuid not null references public.profiles on delete cascade,
+  kind       text not null check (kind in ('move', 'chat', 'emote', 'snowball')),
+  payload    jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists room_events_room_idx on public.room_events (room_id, id);
 
 -- ---------------------------------------------------------------------------
 -- Item catalogue (must stay in sync with src/game/items.ts)
@@ -145,27 +195,16 @@ on conflict (id) do update
   set name = excluded.name, slot = excluded.slot, cost = excluded.cost;
 
 -- ---------------------------------------------------------------------------
--- Guards: the client owns its profile row, but not its wallet or wardrobe
+-- Guards: you may only wear or place what you own
 -- ---------------------------------------------------------------------------
 
--- Clients connect as the `authenticated` role. SECURITY DEFINER functions below
--- run as the table owner, so they bypass these checks legitimately.
 create or replace function public.guard_profile_update()
 returns trigger
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
   v_item text;
 begin
-  if current_user = 'authenticated' then
-    -- Coins may only move through award_coins() / buy_item().
-    new.coins := old.coins;
-    new.last_award := old.last_award;
-  end if;
-
-  -- You may only wear what you own, whoever is asking.
   if new.color is distinct from old.color then
     if not exists (select 1 from public.inventory
                    where profile_id = new.id and item_id = new.color) then
@@ -200,8 +239,6 @@ create trigger guard_profile_update
 create or replace function public.grant_starter_items()
 returns trigger
 language plpgsql
-security definer
-set search_path = public
 as $$
 begin
   insert into public.inventory (profile_id, item_id)
@@ -215,12 +252,15 @@ begin
 end;
 $$;
 
+drop trigger if exists grant_starter_items on public.profiles;
+create trigger grant_starter_items
+  after insert on public.profiles
+  for each row execute function public.grant_starter_items();
+
 -- An igloo may only contain furniture its owner actually bought.
 create or replace function public.guard_igloo()
 returns trigger
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
   v_item text;
@@ -230,7 +270,7 @@ begin
   end if;
 
   if jsonb_array_length(new.items) > 60 then
-    raise exception 'That is a lot of furniture — 60 pieces maximum' using errcode = '22023';
+    raise exception 'That is a lot of furniture - 60 pieces maximum' using errcode = '22023';
   end if;
 
   for v_item in select value ->> 'item' from jsonb_array_elements(new.items) loop
@@ -257,31 +297,20 @@ create trigger guard_igloo
   before update on public.igloos
   for each row execute function public.guard_igloo();
 
-drop trigger if exists grant_starter_items on public.profiles;
-create trigger grant_starter_items
-  after insert on public.profiles
-  for each row execute function public.grant_starter_items();
-
 -- ---------------------------------------------------------------------------
--- RPCs — the only way coins are created or spent
+-- Coins - the only way they are created or spent
 -- ---------------------------------------------------------------------------
 
-create or replace function public.award_coins(p_game text, p_score integer)
+create or replace function public.award_coins(p_actor uuid, p_game text, p_score integer)
 returns integer
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
-  v_cap     integer;
-  v_award   integer;
-  v_coins   integer;
-  v_last    timestamptz;
+  v_cap   integer;
+  v_award integer;
+  v_coins integer;
+  v_last  timestamptz;
 begin
-  if auth.uid() is null then
-    raise exception 'Not signed in' using errcode = '42501';
-  end if;
-
   -- Per-game ceiling: a perfect run is worth a few hundred coins, no more.
   v_cap := case p_game
              when 'sled'    then 350
@@ -295,7 +324,7 @@ begin
 
   v_award := least(greatest(coalesce(p_score, 0), 0), v_cap);
 
-  select last_award into v_last from public.profiles where id = auth.uid() for update;
+  select last_award into v_last from public.profiles where id = p_actor for update;
   if v_last is null then
     raise exception 'No penguin yet' using errcode = '42501';
   end if;
@@ -307,63 +336,51 @@ begin
   update public.profiles
      set coins = coins + v_award,
          last_award = now()
-   where id = auth.uid()
+   where id = p_actor
   returning coins into v_coins;
 
   return v_coins;
 end;
 $$;
 
-create or replace function public.buy_item(p_item text)
+create or replace function public.buy_item(p_actor uuid, p_item text)
 returns integer
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
   v_cost  integer;
   v_coins integer;
 begin
-  if auth.uid() is null then
-    raise exception 'Not signed in' using errcode = '42501';
-  end if;
-
   select cost into v_cost from public.items where id = p_item;
   if v_cost is null then
     raise exception 'No such item' using errcode = '22023';
   end if;
 
   if exists (select 1 from public.inventory
-             where profile_id = auth.uid() and item_id = p_item) then
+             where profile_id = p_actor and item_id = p_item) then
     raise exception 'You already own that' using errcode = '23505';
   end if;
 
   update public.profiles
      set coins = coins - v_cost
-   where id = auth.uid() and coins >= v_cost
+   where id = p_actor and coins >= v_cost
   returning coins into v_coins;
 
   if v_coins is null then
     raise exception 'Not enough coins' using errcode = '53400';
   end if;
 
-  insert into public.inventory (profile_id, item_id) values (auth.uid(), p_item);
+  insert into public.inventory (profile_id, item_id) values (p_actor, p_item);
   return v_coins;
 end;
 $$;
 
 -- Creates the penguin and grants whichever starter colour was picked.
-create or replace function public.create_penguin(p_username text, p_color text)
+create or replace function public.create_penguin(p_actor uuid, p_username text, p_color text)
 returns void
 language plpgsql
-security definer
-set search_path = public
 as $$
 begin
-  if auth.uid() is null then
-    raise exception 'Not signed in' using errcode = '42501';
-  end if;
-
   if p_username !~ '^[A-Za-z0-9 _-]{3,16}$' then
     raise exception 'Names are 3-16 letters, numbers, spaces, - or _' using errcode = '22023';
   end if;
@@ -372,8 +389,8 @@ begin
     raise exception 'Unknown colour' using errcode = '22023';
   end if;
 
-  insert into public.profiles (id, username, color) values (auth.uid(), trim(p_username), p_color);
-  insert into public.inventory (profile_id, item_id) values (auth.uid(), p_color)
+  insert into public.profiles (id, username, color) values (p_actor, trim(p_username), p_color);
+  insert into public.inventory (profile_id, item_id) values (p_actor, p_color)
     on conflict do nothing;
 exception
   when unique_violation then
@@ -386,126 +403,108 @@ $$;
 -- ---------------------------------------------------------------------------
 
 -- Sending a request back to someone who already asked you accepts it instead.
-create or replace function public.send_friend_request(p_to uuid)
+create or replace function public.send_friend_request(p_actor uuid, p_to uuid)
 returns text
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
   v_a uuid;
   v_b uuid;
 begin
-  if auth.uid() is null then
-    raise exception 'Not signed in' using errcode = '42501';
-  end if;
-  if p_to = auth.uid() then
+  if p_to = p_actor then
     raise exception 'You cannot befriend yourself' using errcode = '22023';
   end if;
   if not exists (select 1 from public.profiles where id = p_to) then
     raise exception 'No such penguin' using errcode = '22023';
   end if;
 
-  v_a := least(auth.uid(), p_to);
-  v_b := greatest(auth.uid(), p_to);
+  v_a := least(p_actor, p_to);
+  v_b := greatest(p_actor, p_to);
 
   if exists (select 1 from public.friendships where a = v_a and b = v_b) then
     return 'already';
   end if;
 
   if exists (select 1 from public.friend_requests
-             where from_id = p_to and to_id = auth.uid()) then
+             where from_id = p_to and to_id = p_actor) then
     delete from public.friend_requests
-     where (from_id = p_to and to_id = auth.uid())
-        or (from_id = auth.uid() and to_id = p_to);
+     where (from_id = p_to and to_id = p_actor)
+        or (from_id = p_actor and to_id = p_to);
     insert into public.friendships (a, b) values (v_a, v_b) on conflict do nothing;
     return 'accepted';
   end if;
 
   insert into public.friend_requests (from_id, to_id)
-  values (auth.uid(), p_to)
+  values (p_actor, p_to)
   on conflict do nothing;
   return 'sent';
 end;
 $$;
 
-create or replace function public.accept_friend_request(p_from uuid)
+create or replace function public.accept_friend_request(p_actor uuid, p_from uuid)
 returns void
 language plpgsql
-security definer
-set search_path = public
 as $$
 declare
   v_a uuid;
   v_b uuid;
 begin
   if not exists (select 1 from public.friend_requests
-                 where from_id = p_from and to_id = auth.uid()) then
+                 where from_id = p_from and to_id = p_actor) then
     raise exception 'No such request' using errcode = '22023';
   end if;
-  v_a := least(auth.uid(), p_from);
-  v_b := greatest(auth.uid(), p_from);
+  v_a := least(p_actor, p_from);
+  v_b := greatest(p_actor, p_from);
   delete from public.friend_requests
-   where (from_id = p_from and to_id = auth.uid())
-      or (from_id = auth.uid() and to_id = p_from);
+   where (from_id = p_from and to_id = p_actor)
+      or (from_id = p_actor and to_id = p_from);
   insert into public.friendships (a, b) values (v_a, v_b) on conflict do nothing;
 end;
 $$;
 
-create or replace function public.decline_friend_request(p_from uuid)
+create or replace function public.decline_friend_request(p_actor uuid, p_from uuid)
 returns void
 language sql
-security definer
-set search_path = public
 as $$
-  delete from public.friend_requests where from_id = p_from and to_id = auth.uid();
+  delete from public.friend_requests where from_id = p_from and to_id = p_actor;
 $$;
 
-create or replace function public.remove_friend(p_other uuid)
+create or replace function public.remove_friend(p_actor uuid, p_other uuid)
 returns void
 language sql
-security definer
-set search_path = public
 as $$
   delete from public.friendships
-   where a = least(auth.uid(), p_other) and b = greatest(auth.uid(), p_other);
+   where a = least(p_actor, p_other) and b = greatest(p_actor, p_other);
 $$;
 
-create or replace function public.my_friends()
+create or replace function public.my_friends(p_actor uuid)
 returns table (id uuid, username text, color text, equipped jsonb)
 language sql
-security definer
-set search_path = public
 stable
 as $$
   select p.id, p.username, p.color, p.equipped
     from public.friendships f
     join public.profiles p
-      on p.id = case when f.a = auth.uid() then f.b else f.a end
-   where f.a = auth.uid() or f.b = auth.uid()
+      on p.id = case when f.a = p_actor then f.b else f.a end
+   where f.a = p_actor or f.b = p_actor
    order by p.username;
 $$;
 
-create or replace function public.my_friend_requests()
+create or replace function public.my_friend_requests(p_actor uuid)
 returns table (id uuid, username text, color text, equipped jsonb)
 language sql
-security definer
-set search_path = public
 stable
 as $$
   select p.id, p.username, p.color, p.equipped
     from public.friend_requests r
     join public.profiles p on p.id = r.from_id
-   where r.to_id = auth.uid()
+   where r.to_id = p_actor
    order by r.created_at;
 $$;
 
--- Username availability check that doesn't leak the whole profiles table.
 create or replace function public.username_available(p_username text)
 returns boolean
 language sql
-security definer
-set search_path = public
 stable
 as $$
   select not exists (
@@ -514,84 +513,106 @@ as $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Row level security
+-- room_sync - one round trip per poll: publish me, collect everyone else
 -- ---------------------------------------------------------------------------
 
-alter table public.profiles        enable row level security;
-alter table public.items           enable row level security;
-alter table public.inventory       enable row level security;
-alter table public.igloos          enable row level security;
-alter table public.friendships     enable row level security;
-alter table public.friend_requests enable row level security;
+-- p_events is a JSON array of {kind, payload} the client wants to send.
+-- Returns {players, events, lastId}: who is in the room, and everything that
+-- happened after p_since.
+create or replace function public.room_sync(
+  p_actor  uuid,
+  p_room   text,
+  p_name   text,
+  p_x      integer,
+  p_y      integer,
+  p_tx     integer,
+  p_ty     integer,
+  p_dir    integer,
+  p_since  bigint,
+  p_events jsonb
+)
+returns jsonb
+language plpgsql
+as $$
+declare
+  v_players jsonb;
+  v_events  jsonb;
+  v_last    bigint;
+begin
+  -- A negative cursor means "I just joined": skip whatever was said before.
+  if p_since < 0 then
+    select coalesce(max(id), 0) into p_since from public.room_events;
+  end if;
 
-drop policy if exists "profiles are public" on public.profiles;
-create policy "profiles are public"
-  on public.profiles for select
-  to authenticated
-  using (true);
+  insert into public.presence (profile_id, room_id, room_name, x, y, tx, ty, dir, updated_at)
+  values (p_actor, p_room, coalesce(p_name, p_room), p_x, p_y, p_tx, p_ty,
+          case when p_dir < 0 then -1 else 1 end, now())
+  on conflict (profile_id) do update
+    set room_id = excluded.room_id,
+        room_name = excluded.room_name,
+        x = excluded.x, y = excluded.y,
+        tx = excluded.tx, ty = excluded.ty,
+        dir = excluded.dir,
+        updated_at = now();
 
-drop policy if exists "create own profile" on public.profiles;
-create policy "create own profile"
-  on public.profiles for insert
-  to authenticated
-  with check (id = auth.uid());
+  if p_events is not null and jsonb_typeof(p_events) = 'array' then
+    insert into public.room_events (room_id, from_id, kind, payload)
+    select p_room, p_actor, e ->> 'kind', coalesce(e -> 'payload', '{}'::jsonb)
+      from jsonb_array_elements(p_events) e
+     where e ->> 'kind' in ('move', 'chat', 'emote', 'snowball')
+     limit 20;
+  end if;
 
-drop policy if exists "update own profile" on public.profiles;
-create policy "update own profile"
-  on public.profiles for update
-  to authenticated
-  using (id = auth.uid())
-  with check (id = auth.uid());
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'id', pr.profile_id, 'username', p.username, 'color', p.color,
+           'equipped', p.equipped, 'x', pr.x, 'y', pr.y,
+           'tx', pr.tx, 'ty', pr.ty, 'dir', pr.dir
+         )), '[]'::jsonb)
+    into v_players
+    from public.presence pr
+    join public.profiles p on p.id = pr.profile_id
+   where pr.room_id = p_room
+     and pr.updated_at > now() - interval '15 seconds';
 
-drop policy if exists "items are public" on public.items;
-create policy "items are public"
-  on public.items for select
-  to authenticated
-  using (true);
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'id', e.id, 'from', e.from_id, 'kind', e.kind, 'payload', e.payload
+           || jsonb_build_object('id', e.from_id, 'name', p.username)
+         ) order by e.id), '[]'::jsonb),
+         coalesce(max(e.id), p_since)
+    into v_events, v_last
+    from public.room_events e
+    join public.profiles p on p.id = e.from_id
+   where e.room_id = p_room
+     and e.id > p_since
+     and e.from_id <> p_actor
+     and e.created_at > now() - interval '15 seconds';
 
-drop policy if exists "read own inventory" on public.inventory;
-create policy "read own inventory"
-  on public.inventory for select
-  to authenticated
-  using (profile_id = auth.uid());
+  -- Trim the log now and then rather than on every single poll.
+  if random() < 0.02 then
+    delete from public.room_events where created_at < now() - interval '1 minute';
+    delete from public.presence where updated_at < now() - interval '5 minutes';
+  end if;
 
--- Inventory is written only by buy_item() / grant_starter_items().
--- No insert/update/delete policies == no direct client writes.
+  return jsonb_build_object(
+    'players', v_players,
+    'events', v_events,
+    'lastId', coalesce(v_last, p_since)
+  );
+end;
+$$;
 
--- Igloos are visitable by anyone, editable only by their owner.
-drop policy if exists "igloos are visitable" on public.igloos;
-create policy "igloos are visitable"
-  on public.igloos for select
-  to authenticated
-  using (true);
-
-drop policy if exists "decorate own igloo" on public.igloos;
-create policy "decorate own igloo"
-  on public.igloos for update
-  to authenticated
-  using (owner = auth.uid())
-  with check (owner = auth.uid());
-
--- Friendships are readable by either side; all writes go through the RPCs.
-drop policy if exists "read own friendships" on public.friendships;
-create policy "read own friendships"
-  on public.friendships for select
-  to authenticated
-  using (a = auth.uid() or b = auth.uid());
-
-drop policy if exists "read own friend requests" on public.friend_requests;
-create policy "read own friend requests"
-  on public.friend_requests for select
-  to authenticated
-  using (from_id = auth.uid() or to_id = auth.uid());
-
-grant execute on function public.create_penguin(text, text)        to authenticated;
-grant execute on function public.send_friend_request(uuid)         to authenticated;
-grant execute on function public.accept_friend_request(uuid)       to authenticated;
-grant execute on function public.decline_friend_request(uuid)      to authenticated;
-grant execute on function public.remove_friend(uuid)               to authenticated;
-grant execute on function public.my_friends()                      to authenticated;
-grant execute on function public.my_friend_requests()              to authenticated;
-grant execute on function public.award_coins(text, integer)  to authenticated;
-grant execute on function public.buy_item(text)              to authenticated;
-grant execute on function public.username_available(text)    to authenticated;
+-- Who is on the island and which room they are in. Powers the map counts and
+-- the online dots in the friends list.
+create or replace function public.island_online()
+returns jsonb
+language sql
+stable
+as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'id', pr.profile_id, 'username', p.username, 'color', p.color,
+           'equipped', p.equipped, 'room', pr.room_id, 'roomName', pr.room_name
+         )), '[]'::jsonb)
+    from public.presence pr
+    join public.profiles p on p.id = pr.profile_id
+   where pr.updated_at > now() - interval '20 seconds';
+$$;

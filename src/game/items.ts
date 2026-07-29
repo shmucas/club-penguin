@@ -467,7 +467,7 @@ const skis: Item['draw'] = (ctx) => {
 }
 
 // ---------------------------------------------------------------------------
-// Catalogue — ids and costs must match supabase/schema.sql
+// Catalogue - ids and costs must match db/schema.sql
 // ---------------------------------------------------------------------------
 
 function colorItem(id: string, name: string, cost: number): Item {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { supabase } from '../lib/supabase'
+import { logIn, signUp, type Me } from '../lib/api'
 import { paintTitleScene } from '../game/rooms'
 import { WORLD_H, WORLD_W, drawPenguin } from '../game/render'
 import type { PlayerState } from '../lib/types'
@@ -74,7 +74,12 @@ function useTitleBackdrop(canvasRef: React.RefObject<HTMLCanvasElement>) {
   }, [canvasRef])
 }
 
-export function Auth() {
+interface Props {
+  /** Called with the fresh session once the account is created or logged in. */
+  onAuthed: (me: Me) => void
+}
+
+export function Auth({ onAuthed }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   useTitleBackdrop(canvasRef)
 
@@ -83,26 +88,13 @@ export function Auth() {
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     setBusy(true)
     setError(null)
-    setNotice(null)
     try {
-      if (mode === 'up') {
-        const { data, error } = await supabase.auth.signUp({ email, password })
-        if (error) throw error
-        if (!data.session) {
-          setNotice(
-            'Check your inbox for a confirmation link. (Building this for a friend? Turn off "Confirm email" in Supabase → Authentication → Providers → Email.)',
-          )
-        }
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({ email, password })
-        if (error) throw error
-      }
+      onAuthed(mode === 'up' ? await signUp(email, password) : await logIn(email, password))
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
@@ -163,7 +155,6 @@ export function Auth() {
           </label>
 
           {error && <p className="error-line">{error}</p>}
-          {notice && <p className="notice-line">{notice}</p>}
 
           <button className="btn primary big" disabled={busy} type="submit">
             {busy ? 'Just a sec…' : mode === 'up' ? 'Create my penguin' : 'Enter the island'}
