@@ -1,12 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { dbError, sql } from './_lib/db'
+import { dbError, sql } from './_lib/db.js'
 import {
   clearSessionCookie,
   getUserId,
   hashPassword,
   setSessionCookie,
   verifyPassword,
-} from './_lib/session'
+} from './_lib/session.js'
 
 interface ProfileRow {
   id: string

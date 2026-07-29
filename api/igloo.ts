@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { dbError, sql } from './_lib/db'
-import { requireUser } from './_lib/session'
+import { dbError, sql } from './_lib/db.js'
+import { requireUser } from './_lib/session.js'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

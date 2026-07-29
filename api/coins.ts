@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { dbError, sql } from './_lib/db'
-import { requireMethod, requireUser } from './_lib/session'
+import { dbError, sql } from './_lib/db.js'
+import { requireMethod, requireUser } from './_lib/session.js'
 
 /**
  * POST /api/coins
